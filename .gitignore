@@ -1,0 +1,6 @@
+.pixi/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+dist/
+*.so
