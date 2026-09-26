@@ -4,7 +4,13 @@ import math
 
 import numpy as np
 
-from ._lib import addr, lib
+from ._lib import (
+    ELEMENTS_PER_WORKER,
+    MAX_ELEMENT_WORKERS,
+    addr,
+    lib,
+    run_element_chunks,
+)
 
 
 def _scalar(array: np.ndarray):
@@ -112,7 +118,13 @@ def _dispatch_geometry(nside, inputs, output_count, symbol, nest):
         arguments.extend(addr(value, value.dtype) for value in flat_inputs)
         arguments.extend(addr(value, value.dtype, writable=True) for value in outputs)
         arguments.extend((flat_inputs[0].size, int(nest)))
-        getattr(lib(), symbol)(*arguments)
+        run_element_chunks(
+            getattr(lib(), symbol),
+            arguments,
+            flat_inputs[0].size,
+            per_worker=ELEMENTS_PER_WORKER,
+            max_workers=MAX_ELEMENT_WORKERS,
+        )
         return [value.reshape(shape) for value in outputs]
 
     arrays = np.broadcast_arrays(nside_array, *[np.asarray(v) for v in inputs])
@@ -135,7 +147,13 @@ def _dispatch_geometry(nside, inputs, output_count, symbol, nest):
         arguments.extend(addr(v, v.dtype) for v in packed_inputs)
         arguments.extend(addr(v, v.dtype, writable=True) for v in packed_outputs)
         arguments.extend((int(mask.sum()), int(nest)))
-        getattr(lib(), symbol)(*arguments)
+        run_element_chunks(
+            getattr(lib(), symbol),
+            arguments,
+            int(mask.sum()),
+            per_worker=ELEMENTS_PER_WORKER,
+            max_workers=MAX_ELEMENT_WORKERS,
+        )
         for target, packed in zip(outputs, packed_outputs):
             target[mask] = packed
     return [value.reshape(shape) for value in outputs]
@@ -237,12 +255,18 @@ def _order_convert(nside, ipix, nested_output):
     destination = np.empty_like(source)
     if source.size == 0:
         return _scalar(destination)
-    lib().mhp_order_convert(
-        int(nside),
-        addr(source, np.int64),
-        addr(destination, np.int64, writable=True),
+    run_element_chunks(
+        lib().mhp_order_convert,
+        [
+            int(nside),
+            addr(source, np.int64),
+            addr(destination, np.int64, writable=True),
+            source.size,
+            int(nested_output),
+        ],
         source.size,
-        int(nested_output),
+        per_worker=ELEMENTS_PER_WORKER,
+        max_workers=MAX_ELEMENT_WORKERS,
     )
     return _scalar(destination)
 

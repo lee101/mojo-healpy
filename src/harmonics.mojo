@@ -1,13 +1,11 @@
 """Scalar spherical-harmonic synthesis, analysis, and spectra."""
 
-from std.algorithm import parallelize
 from std.math import cos, sin, sqrt
 from std.sys.info import simd_width_of
 
 from kernels import FPtr, PI, fp, pix_to_zphi
 
 comptime INV_SQRT_4PI = 0.282094791773878143474039725780386292
-comptime TRANSFORM_PARALLEL_THRESHOLD = 4096
 
 
 def alm_index(lmax: Int, ell: Int, m: Int) -> Int:
@@ -64,23 +62,6 @@ def synthesize_range(
         maps[pixel] = value
 
 
-def synthesize(alms: FPtr, maps: FPtr, nside: Int, lmax: Int, mmax: Int):
-    var npix = 12 * nside * nside
-    if npix < TRANSFORM_PARALLEL_THRESHOLD:
-        synthesize_range(alms, maps, nside, lmax, mmax, 0, npix)
-        return
-
-    comptime TASKS = 32
-
-    @parameter
-    def worker(task: Int):
-        var start = task * npix // TASKS
-        var end = (task + 1) * npix // TASKS
-        synthesize_range(alms, maps, nside, lmax, mmax, start, end)
-
-    parallelize[worker](TASKS, TASKS)
-
-
 def analyze_range(
     maps: FPtr,
     alms: FPtr,
@@ -128,38 +109,22 @@ def analyze_range(
                 previous = current
 
 
-def analyze_serial(maps: FPtr, alms: FPtr, nside: Int, lmax: Int, mmax: Int):
-    var nalm = (mmax + 1) * (2 * lmax + 2 - mmax) // 2
-    for i in range(2 * nalm):
-        alms[i] = 0.0
-    analyze_range(
-        maps, alms, nside, lmax, mmax, 0, 12 * nside * nside
-    )
-
-
-def analyze_parallel(
+def analyze_partial(
     maps: FPtr,
-    alms: FPtr,
     partials: FPtr,
     nside: Int,
     lmax: Int,
     mmax: Int,
-    tasks: Int,
+    start: Int,
+    stop: Int,
 ):
-    var npix = 12 * nside * nside
     var ncoeff = 2 * (mmax + 1) * (2 * lmax + 2 - mmax) // 2
+    for i in range(ncoeff):
+        partials[i] = 0.0
+    analyze_range(maps, partials, nside, lmax, mmax, start, stop)
 
-    @parameter
-    def worker(task: Int):
-        var local = partials + task * ncoeff
-        for i in range(ncoeff):
-            local[i] = 0.0
-        var start = task * npix // tasks
-        var end = (task + 1) * npix // tasks
-        analyze_range(maps, local, nside, lmax, mmax, start, end)
 
-    parallelize[worker](tasks, tasks)
-
+def reduce_partials(partials: FPtr, alms: FPtr, ncoeff: Int, tasks: Int):
     comptime W = simd_width_of[DType.float64]()
     var i = 0
     var vector_end = (ncoeff // W) * W
@@ -177,76 +142,85 @@ def analyze_parallel(
         i += 1
 
 
+def subtract_maps(maps: FPtr, residual: FPtr, n: Int):
+    # One 8-byte load, one 8-byte store and one flop per element. Streaming,
+    # so this stays a single serial pass.
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    var vector_end = (n // W) * W
+    while i < vector_end:
+        residual.store(i, maps.load[width=W](i) - residual.load[width=W](i))
+        i += W
+    while i < n:
+        residual[i] = maps[i] - residual[i]
+        i += 1
+
+
+def accumulate_alms(alms: FPtr, correction: FPtr, ncoeff: Int):
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    var vector_end = (ncoeff // W) * W
+    while i < vector_end:
+        alms.store(i, alms.load[width=W](i) + correction.load[width=W](i))
+        i += W
+    while i < ncoeff:
+        alms[i] += correction[i]
+        i += 1
+
+
 def alm2map_kernel(
-    alm_address: Int, map_address: Int, nside: Int, lmax: Int, mmax: Int
-):
-    synthesize(fp(alm_address), fp(map_address), nside, lmax, mmax)
-
-
-def map2alm_kernel(
-    map_address: Int,
     alm_address: Int,
-    residual_address: Int,
-    correction_address: Int,
+    map_address: Int,
+    nside: Int,
+    lmax: Int,
+    mmax: Int,
+    start: Int,
+    stop: Int,
+):
+    # O(lmax^2) Legendre recursion with two square roots and a divide per
+    # step, so this is heavily compute-bound and the caller splits the pixel
+    # range across worker threads.
+    synthesize_range(
+        fp(alm_address), fp(map_address), nside, lmax, mmax, start, stop
+    )
+
+
+def map2alm_analyze_kernel(
+    map_address: Int,
     partial_address: Int,
     nside: Int,
     lmax: Int,
     mmax: Int,
-    iterations: Int,
-    analyze_tasks: Int,
+    start: Int,
+    stop: Int,
 ):
-    var maps = fp(map_address)
-    var alms = fp(alm_address)
-    var npix = 12 * nside * nside
-    var nalm = (mmax + 1) * (2 * lmax + 2 - mmax) // 2
-    if analyze_tasks > 1:
-        analyze_parallel(
-            maps,
-            alms,
-            fp(partial_address),
-            nside,
-            lmax,
-            mmax,
-            analyze_tasks,
-        )
-    else:
-        analyze_serial(maps, alms, nside, lmax, mmax)
-    for _ in range(iterations):
-        var residual = fp(residual_address)
-        var correction = fp(correction_address)
-        synthesize(alms, residual, nside, lmax, mmax)
-        comptime W = simd_width_of[DType.float64]()
-        var i = 0
-        var vector_end = (npix // W) * W
-        while i < vector_end:
-            residual.store(
-                i,
-                maps.load[width=W](i) - residual.load[width=W](i),
-            )
-            i += W
-        while i < npix:
-            residual[i] = maps[i] - residual[i]
-            i += 1
-        if analyze_tasks > 1:
-            analyze_parallel(
-                residual,
-                correction,
-                fp(partial_address),
-                nside,
-                lmax,
-                mmax,
-                analyze_tasks,
-            )
-        else:
-            analyze_serial(residual, correction, nside, lmax, mmax)
-        i = 0
-        vector_end = ((2 * nalm) // W) * W
-        while i < vector_end:
-            alms.store(
-                i,
-                alms.load[width=W](i) + correction.load[width=W](i),
-            )
-            i += W
-        while i < 2 * nalm:
-            alms[i] += correction[i]
-            i += 1
+    analyze_partial(
+        fp(map_address),
+        fp(partial_address),
+        nside,
+        lmax,
+        mmax,
+        start,
+        stop,
+    )
+
+
+def map2alm_reduce_kernel(
+    partial_address: Int,
+    alm_address: Int,
+    ncoeff: Int,
+    tasks: Int,
+):
+    reduce_partials(fp(partial_address), fp(alm_address), ncoeff, tasks)
+
+
+def map2alm_residual_kernel(
+    map_address: Int, residual_address: Int, n: Int
+):
+    subtract_maps(fp(map_address), fp(residual_address), n)
+
+
+def map2alm_update_kernel(
+    alm_address: Int, correction_address: Int, ncoeff: Int
+):
+    accumulate_alms(fp(alm_address), fp(correction_address), ncoeff)

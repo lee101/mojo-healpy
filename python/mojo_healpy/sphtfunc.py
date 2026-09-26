@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from ._lib import addr, lib
+from ._lib import addr, lib, run_indexed_chunks, run_pixel_chunks
 from .pixelfunc import npix2nside, nside2npix
 
 UNSEEN = -1.6375e30
@@ -111,18 +111,21 @@ def alm2map(
     result = np.empty((rows.shape[0], nside2npix(nside)), dtype=np.float64)
     for source, target in zip(rows, result):
         source = _alm_array(source)
-        function = (
-            lib().mhp_alm2map_gpu if device == "gpu" else lib().mhp_alm2map
-        )
-        status = function(
+        arguments = [
             addr(source, np.complex128),
             addr(target, np.float64, writable=True),
             int(nside),
             input_lmax,
             input_mmax,
-        )
-        if device == "gpu" and status != 1:
-            raise RuntimeError("GPU synthesis failed or exceeded its 2 GB safety limit")
+        ]
+        if device == "gpu":
+            status = lib().mhp_alm2map_gpu(*arguments)
+            if status != 1:
+                raise RuntimeError(
+                    "GPU synthesis failed or exceeded its 2 GB safety limit"
+                )
+        else:
+            run_pixel_chunks(lib().mhp_alm2map, arguments, target.size)
     return result[0] if single else result
 
 
@@ -164,33 +167,60 @@ def map2alm(
         if np.any(invalid):
             source = source.copy()
             source[invalid] = 0.0
-        residual = (
-            np.empty(source.size, dtype=np.float64) if int(iter) > 0 else None
-        )
-        correction = (
-            np.empty(target.size, dtype=np.complex128) if int(iter) > 0 else None
-        )
         max_tasks = (128 * 1024 * 1024) // target.nbytes
         analyze_tasks = (
             min(32, max_tasks) if source.size >= 4096 and max_tasks >= 2 else 1
         )
-        partials = (
-            np.empty((analyze_tasks, target.size), dtype=np.complex128)
-            if analyze_tasks > 1
-            else None
-        )
-        lib().mhp_map2alm(
-            addr(source, np.float64),
-            addr(target, np.complex128, writable=True),
-            0 if residual is None else addr(residual, np.float64, writable=True),
-            0 if correction is None else addr(correction, np.complex128, writable=True),
-            0 if partials is None else addr(partials, np.complex128, writable=True),
-            nside,
-            lmax,
-            mmax,
-            int(iter),
-            analyze_tasks,
-        )
+        partials = np.empty((analyze_tasks, target.size), dtype=np.complex128)
+
+        def analyze(maps, alms, maps_address):
+            run_indexed_chunks(
+                lib().mhp_map2alm_analyze,
+                lambda task: [
+                    maps_address,
+                    addr(partials[task], np.complex128, writable=True),
+                    nside,
+                    lmax,
+                    mmax,
+                ],
+                source.size,
+                analyze_tasks,
+            )
+            lib().mhp_map2alm_reduce(
+                addr(partials, np.complex128),
+                addr(alms, np.complex128, writable=True),
+                2 * target.size,
+                analyze_tasks,
+            )
+
+        analyze(source, target, addr(source, np.float64))
+        if int(iter) <= 0:
+            continue
+        residual = np.empty(source.size, dtype=np.float64)
+        correction = np.empty(target.size, dtype=np.complex128)
+        residual_address = addr(residual, np.float64, writable=True)
+        correction_address = addr(correction, np.complex128, writable=True)
+        for _ in range(int(iter)):
+            run_pixel_chunks(
+                lib().mhp_alm2map,
+                [
+                    addr(target, np.complex128),
+                    residual_address,
+                    nside,
+                    lmax,
+                    mmax,
+                ],
+                source.size,
+            )
+            lib().mhp_map2alm_residual(
+                addr(source, np.float64), residual_address, source.size
+            )
+            analyze(residual, correction, residual_address)
+            lib().mhp_map2alm_update(
+                addr(target, np.complex128, writable=True),
+                correction_address,
+                2 * target.size,
+            )
     return result[0] if single else result
 
 

@@ -1,14 +1,11 @@
 """HEALPix geometry kernels."""
 
-from std.algorithm import parallelize
 from std.math import acos, atan2, cos, floor, sin, sqrt
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime PI = 3.141592653589793238462643383279502884
 comptime TWOPI = 6.283185307179586476925286766559005768
-comptime GEOMETRY_PARALLEL_THRESHOLD = 65536
-comptime PARALLEL_TASKS = 64
 
 
 def fp(address: Int) -> FPtr:
@@ -202,27 +199,19 @@ def pix2ang_kernel(
     phi_address: Int,
     n: Int,
     nest: Int,
+    start: Int,
+    stop: Int,
 ):
+    # Every element costs an acos plus a divide over 24 bytes of traffic,
+    # so these transforms are compute-bound and the caller splits the
+    # element range across worker threads.
     var pixels = ip(pixels_address)
     var theta = fp(theta_address)
     var phi = fp(phi_address)
-    if n < GEOMETRY_PARALLEL_THRESHOLD:
-        for i in range(n):
-            var z, p = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
-            theta[i] = acos(max(-1.0, min(1.0, z)))
-            phi[i] = p
-        return
-
-    @parameter
-    def worker(task: Int):
-        var start = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(start, end):
-            var z, p = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
-            theta[i] = acos(max(-1.0, min(1.0, z)))
-            phi[i] = p
-
-    parallelize[worker](PARALLEL_TASKS, PARALLEL_TASKS)
+    for i in range(start, stop):
+        var z, p = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
+        theta[i] = acos(max(-1.0, min(1.0, z)))
+        phi[i] = p
 
 
 def ang2pix_kernel(
@@ -232,23 +221,14 @@ def ang2pix_kernel(
     pixels_address: Int,
     n: Int,
     nest: Int,
+    start: Int,
+    stop: Int,
 ):
     var theta = fp(theta_address)
     var phi = fp(phi_address)
     var pixels = ip(pixels_address)
-    if n < GEOMETRY_PARALLEL_THRESHOLD:
-        for i in range(n):
-            pixels[i] = Int64(ang_to_pix(nside, theta[i], phi[i], nest != 0))
-        return
-
-    @parameter
-    def worker(task: Int):
-        var start = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(start, end):
-            pixels[i] = Int64(ang_to_pix(nside, theta[i], phi[i], nest != 0))
-
-    parallelize[worker](PARALLEL_TASKS, PARALLEL_TASKS)
+    for i in range(start, stop):
+        pixels[i] = Int64(ang_to_pix(nside, theta[i], phi[i], nest != 0))
 
 
 def pix2vec_kernel(
@@ -259,32 +239,19 @@ def pix2vec_kernel(
     z_address: Int,
     n: Int,
     nest: Int,
+    start: Int,
+    stop: Int,
 ):
     var pixels = ip(pixels_address)
     var x = fp(x_address)
     var y = fp(y_address)
     var z_dst = fp(z_address)
-    if n < GEOMETRY_PARALLEL_THRESHOLD:
-        for i in range(n):
-            var z, phi = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
-            var r = sqrt(max(0.0, 1.0 - z * z))
-            x[i] = r * cos(phi)
-            y[i] = r * sin(phi)
-            z_dst[i] = z
-        return
-
-    @parameter
-    def worker(task: Int):
-        var start = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(start, end):
-            var z, phi = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
-            var r = sqrt(max(0.0, 1.0 - z * z))
-            x[i] = r * cos(phi)
-            y[i] = r * sin(phi)
-            z_dst[i] = z
-
-    parallelize[worker](PARALLEL_TASKS, PARALLEL_TASKS)
+    for i in range(start, stop):
+        var z, phi = pix_to_zphi(nside, Int(pixels[i]), nest != 0)
+        var r = sqrt(max(0.0, 1.0 - z * z))
+        x[i] = r * cos(phi)
+        y[i] = r * sin(phi)
+        z_dst[i] = z
 
 
 def vec2pix_kernel(
@@ -295,30 +262,18 @@ def vec2pix_kernel(
     pixels_address: Int,
     n: Int,
     nest: Int,
+    start: Int,
+    stop: Int,
 ):
     var x = fp(x_address)
     var y = fp(y_address)
     var z = fp(z_address)
     var pixels = ip(pixels_address)
-    if n < GEOMETRY_PARALLEL_THRESHOLD:
-        for i in range(n):
-            var norm = sqrt(x[i] * x[i] + y[i] * y[i] + z[i] * z[i])
-            var theta = acos(max(-1.0, min(1.0, z[i] / norm)))
-            var phi = atan2(y[i], x[i])
-            pixels[i] = Int64(ang_to_pix(nside, theta, phi, nest != 0))
-        return
-
-    @parameter
-    def worker(task: Int):
-        var start = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(start, end):
-            var norm = sqrt(x[i] * x[i] + y[i] * y[i] + z[i] * z[i])
-            var theta = acos(max(-1.0, min(1.0, z[i] / norm)))
-            var phi = atan2(y[i], x[i])
-            pixels[i] = Int64(ang_to_pix(nside, theta, phi, nest != 0))
-
-    parallelize[worker](PARALLEL_TASKS, PARALLEL_TASKS)
+    for i in range(start, stop):
+        var norm = sqrt(x[i] * x[i] + y[i] * y[i] + z[i] * z[i])
+        var theta = acos(max(-1.0, min(1.0, z[i] / norm)))
+        var phi = atan2(y[i], x[i])
+        pixels[i] = Int64(ang_to_pix(nside, theta, phi, nest != 0))
 
 
 def order_convert_kernel(
@@ -327,25 +282,13 @@ def order_convert_kernel(
     destination_address: Int,
     n: Int,
     nested_output: Int,
+    start: Int,
+    stop: Int,
 ):
     var source = ip(source_address)
     var destination = ip(destination_address)
-    if n < GEOMETRY_PARALLEL_THRESHOLD:
-        for i in range(n):
-            var z, phi = pix_to_zphi(nside, Int(source[i]), nested_output == 0)
-            destination[i] = Int64(
-                zphi_to_pix(nside, z, phi, nested_output != 0)
-            )
-        return
-
-    @parameter
-    def worker(task: Int):
-        var start = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(start, end):
-            var z, phi = pix_to_zphi(nside, Int(source[i]), nested_output == 0)
-            destination[i] = Int64(
-                zphi_to_pix(nside, z, phi, nested_output != 0)
-            )
-
-    parallelize[worker](PARALLEL_TASKS, PARALLEL_TASKS)
+    for i in range(start, stop):
+        var z, phi = pix_to_zphi(nside, Int(source[i]), nested_output == 0)
+        destination[i] = Int64(
+            zphi_to_pix(nside, z, phi, nested_output != 0)
+        )

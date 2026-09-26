@@ -1,7 +1,7 @@
 """Optional GPU spherical-harmonic synthesis."""
 
-from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext
 from std.math import floor, sqrt
 
 from harmonics import INV_SQRT_4PI, alm_index
@@ -96,38 +96,38 @@ def sincos_f64(value: Float64) -> Tuple[Float64, Float64]:
 def synthesize_gpu(
     alms: FPtr,
     maps: FPtr,
-    nside: Int,
-    lmax: Int,
-    mmax: Int,
-    npix: Int,
+    nside: Int32,
+    lmax: Int32,
+    mmax: Int32,
+    npix: Int32,
 ):
-    var pixel = global_idx.x
-    if pixel >= npix:
+    var pixel = Int(global_idx.x)
+    if pixel >= Int(npix):
         return
-    var z, phi = pix_to_zphi(nside, pixel, False)
+    var z, phi = pix_to_zphi(Int(nside), pixel, False)
     var sintheta = sqrt(max(0.0, 1.0 - z * z))
     var lambda_mm = INV_SQRT_4PI
     var value = 0.0
-    for m in range(mmax + 1):
+    for m in range(Int(mmax) + 1):
         if m > 0:
             lambda_mm *= (
                 -sqrt(Float64(2 * m + 1) / Float64(2 * m)) * sintheta
             )
         var s, c = sincos_f64(Float64(m) * phi)
         var factor = 1.0 if m == 0 else 2.0
-        var idx = alm_index(lmax, m, m)
+        var idx = alm_index(Int(lmax), m, m)
         value += factor * lambda_mm * (
             alms[2 * idx] * c - alms[2 * idx + 1] * s
         )
-        if m >= lmax:
+        if m >= Int(lmax):
             continue
         var previous2 = lambda_mm
         var previous = z * sqrt(Float64(2 * m + 3)) * lambda_mm
-        idx = alm_index(lmax, m + 1, m)
+        idx = alm_index(Int(lmax), m + 1, m)
         value += factor * previous * (
             alms[2 * idx] * c - alms[2 * idx + 1] * s
         )
-        for ell in range(m + 2, lmax + 1):
+        for ell in range(m + 2, Int(lmax) + 1):
             var e = Float64(ell)
             var mm = Float64(m * m)
             var alpha = sqrt((e * e - mm) / (4.0 * e * e - 1.0))
@@ -136,7 +136,7 @@ def synthesize_gpu(
                 (em1 * em1 - mm) / (4.0 * em1 * em1 - 1.0)
             )
             var current = (z * previous - beta * previous2) / alpha
-            idx = alm_index(lmax, ell, m)
+            idx = alm_index(Int(lmax), ell, m)
             value += factor * current * (
                 alms[2 * idx] * c - alms[2 * idx + 1] * s
             )
@@ -162,10 +162,10 @@ def alm2map_gpu(
     ctx.enqueue_function[synthesize_gpu](
         device_alms.unsafe_ptr(),
         device_maps.unsafe_ptr(),
-        nside,
-        lmax,
-        mmax,
-        npix,
+        Int32(nside),
+        Int32(lmax),
+        Int32(mmax),
+        Int32(npix),
         grid_dim=(npix + BLOCK_SIZE - 1) // BLOCK_SIZE,
         block_dim=BLOCK_SIZE,
     )
